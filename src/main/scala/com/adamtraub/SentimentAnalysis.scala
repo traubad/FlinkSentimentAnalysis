@@ -35,20 +35,17 @@ object SentimentAnalysis {
 
       val chatText = dataStream
         .map { w =>
-          getSentimentData(w.split(",").drop(2).mkString(","))
+          val language = LanguageServiceClient.create()
+          val text = w.split(",").drop(2).mkString(",")
+          val sentiment = language.analyzeSentiment(Document.newBuilder()
+            .setContent(text)
+            .setType(Type.PLAIN_TEXT)
+            .build()).getDocumentSentiment
+          language.close()
+          sentimentData(text, sentiment.getScore, sentiment.getMagnitude)
         }
       chatText.print()
       env.execute("Window Stream WordCount")
-    }
-
-    def getSentimentData(text: String): sentimentData = {
-      val language = LanguageServiceClient.create()
-      val sentiment = language.analyzeSentiment(Document.newBuilder()
-        .setContent(text)
-        .setType(Type.PLAIN_TEXT)
-        .build()).getDocumentSentiment
-      language.close()
-      sentimentData(text, sentiment.getScore, sentiment.getMagnitude)
     }
 
     case class sentimentData(text: String, score: Float, magnitude: Float)
