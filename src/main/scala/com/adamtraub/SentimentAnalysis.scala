@@ -18,9 +18,12 @@
 
 package com.adamtraub
 
-import com.google.cloud.language.v1.{Document, LanguageServiceClient}
+import com.google.cloud.language.v1._
 import com.google.cloud.language.v1.Document.Type
 import org.apache.flink.streaming.api.scala._
+
+import scala.collection.JavaConversions._
+import scala.collection.mutable.MutableList
 
 object SentimentAnalysis {
   def main(args: Array[String]) {
@@ -34,22 +37,46 @@ object SentimentAnalysis {
       val dataStream = env.socketTextStream(url, port)
 
       val chatText = dataStream
-        .map { w =>
+        .flatMap { w =>
+          val text = w.split(",")
+            .drop(2)
+            .mkString(",")
+
+          var outList = new MutableList[TextData]
+
           val language = LanguageServiceClient.create()
-          val text = w.split(",").drop(2).mkString(",")
-          val sentiment = language.analyzeSentiment(Document.newBuilder()
+
+          val doc = Document.newBuilder()
             .setContent(text)
             .setType(Type.PLAIN_TEXT)
-            .build()).getDocumentSentiment
-          language.close()
-          sentimentData(text, sentiment.getScore, sentiment.getMagnitude)
+            .build()
+
+          val syntax = language.analyzeSyntax(AnalyzeSyntaxRequest.newBuilder()
+            .setDocument(doc)
+            .setEncodingType(EncodingType.UTF16)
+            .build())
+
+          val sentiment = language.analyzeSentiment(doc).getDocumentSentiment
+
+          if(text.split(" ").length >= 25){
+            val classification = language.classifyText(ClassifyTextRequest.newBuilder()
+              .setDocument(doc)
+              .build())
+            for (cat <- classification.getCategoriesList){
+              outList += contentData(cat.getName, cat.getConfidence)
+            }
+          }
+
+          outList += sentimentData(text, sentiment.getScore, sentiment.getMagnitude)
         }
       chatText.print()
-      env.execute("Window Stream WordCount")
+      env.execute("Text Analysis")
     }
 
-    case class sentimentData(text: String, score: Float, magnitude: Float)
-    case class chatData(room: String, user: String, message: String)
+    abstract class TextData {}
+    case class sentimentData(text: String, score: Float, magnitude: Float) extends TextData
+    case class chatData(room: String, user: String, message: String) extends TextData
+    case class contentData(category: String, confidence: Float) extends TextData
 }
 
 
