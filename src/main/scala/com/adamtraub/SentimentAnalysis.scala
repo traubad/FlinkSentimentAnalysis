@@ -50,10 +50,11 @@ object SentimentAnalysis {
         Message(msg(0), msg(1), msg.drop(2).mkString(","))
       },(5,0))
 
-    //blocks a given user's messages together every 100 seconds
+    //blocks a given user's messages together every 100 seconds for larger, categorical analysis
     val aggregateStream: DataStream[Message] =
       processMessageStream(parsedStream,(100,0))
 
+    //A stream to get Sentiment based on the user's input
     val sentimentStream: DataStream[MessageSentiment] = parsedStream
       .map { mData =>
         //var sentiments = new mutable.MutableList[MessageSentiment]
@@ -76,8 +77,9 @@ object SentimentAnalysis {
 //        sentiments.toList
       }
 
-    val entityStream: DataStream[MessageEntities] = parsedStream
-      .map { mData =>
+    //The entity stream creates a list of entities and their corresponding sentiments
+    val entityStream: DataStream[Entity] = parsedStream
+      .flatMap { mData =>
 
         var entities = new mutable.MutableList[Entity]
         val language = LanguageServiceClient.create()
@@ -86,34 +88,32 @@ object SentimentAnalysis {
           .setType(Type.PLAIN_TEXT)
           .build()
 
-        language.analyzeEntities(AnalyzeEntitiesRequest
+        val entitiesList = language.analyzeEntitySentiment(AnalyzeEntitySentimentRequest
             .newBuilder()
             .setDocument(doc)
             .setEncodingType(EncodingType.UTF16)
             .build())
           .getEntitiesList
-          .map { ent =>
+        language.close()
+        entitiesList
+            .map { ent =>
             entities += Entity(
-              ent.getName,
-              ent.getSalience,
-              Sentiment(
+              entity = ent.getName,
+              salience = ent.getSalience,
+              sentiment = Sentiment(
                 ent.getSentiment.getScore,
                 ent.getSentiment.getMagnitude
               )
             )
           }
+        entities
+      }.filter( _.sentiment.score == 0)
 
-        language.close()
-        MessageEntities(
-          message = mData,
-          entities = entities.toList
-        )
-      }
-
+    //This attempts to take a block of text and determine the topics/categories
     val categoryStream: DataStream[MessageCategories] = aggregateStream
       .map { mData =>
         var outList = new mutable.MutableList[Category]
-        if(mData.text.split(" ").length >= 25) {
+        if(mData.text.split(" ").length >= 25) { //minimum 20 words for api, 25 for good measure
           val language = LanguageServiceClient.create()
 
           val doc = Document.newBuilder()
@@ -148,22 +148,34 @@ object SentimentAnalysis {
     val userMoodStream: DataStream[Mood] =
       buildMoodStream(
         stream = sentimentStream,
-        entityExtractor = sData => sData.message.user,
+        keyExtractor = (sData: MessageSentiment) => sData.message.user:String,
         moodType = "User",
-        timings = (90,60))
+        timings = (90,60)
+      )
 
     val channelMoodStream: DataStream[Mood] =
       buildMoodStream(
         stream = sentimentStream,
-        entityExtractor = sData => sData.message.channel,
+        keyExtractor = (sData: MessageSentiment) => sData.message.channel:String,
         moodType ="Channel",
-        timings = (90,60))
+        timings = (90,60)
+      )
 
     val categoryOpinionStream: DataStream[Mood] =
       buildMoodStream(
         stream = categorySentimentStream,
-        entityExtractor = sData => sData.category.category,
-        timings = (0,0))
+        keyExtractor = (sData: CategorySentiment) => sData.category.category:String,
+        moodType="Category",
+        timings = (0,0)//this one runs immediately because categorical data is already slow
+      )
+
+    val entityOpinionStream: DataStream[Mood] =
+      buildMoodStream(
+        stream = entityStream,
+        keyExtractor = (sData: Entity) => sData.entity:String,
+        moodType="Entity",
+        timings = (30,0)
+      )
 
     val toxicUserStream: DataStream[Mood] =
       buildToxicityStream(
@@ -180,6 +192,7 @@ object SentimentAnalysis {
 
     sentimentStream.print()
     entityStream.print()
+    entityOpinionStream.print()
     userMoodStream.print()
     channelMoodStream.print()
     toxicUserStream.print()
@@ -189,6 +202,7 @@ object SentimentAnalysis {
     env.execute("Slack Analysis")
   }
 
+  //This helper method reduces some repeated code and prevents
   def getSentimentFromString(text: String): com.google.cloud.language.v1.Sentiment = {
     val language = LanguageServiceClient.create()
     val document = language.analyzeSentiment(Document.newBuilder()
@@ -200,38 +214,28 @@ object SentimentAnalysis {
     document.getDocumentSentiment
   }
 
-
-  def buildMoodStream(stream: DataStream[MessageSentiment],
-                  entityExtractor: MessageSentiment => String,
-                  moodType: String, timings: (Int,Int)): DataStream[Mood] =
+  // This notation took a while to make work.  A <: HoldsSentiment means that A extends HoldsSentiment
+  def buildMoodStream[A <: HoldsSentiment](
+                          stream: DataStream[A],
+                          keyExtractor: A => String,
+                          moodType: String,
+                          timings: (Int,Int)
+                        ): DataStream[Mood] =
     processChatStream(stream.map{ sData =>
         Mood(
-          entity=entityExtractor(sData),
+          key=keyExtractor(sData),
           value=sData.sentiment.magnitude*sData.sentiment.score,
           moodType=moodType
         )
-      },("entity",""),timings, moodReduce)
-
-  def buildMoodStream(stream: DataStream[CategorySentiment],
-                  entityExtractor: CategorySentiment => String,
-                  timings: (Int,Int)): DataStream[Mood] =
-    processMoodStream(stream.map{ sData =>
-      Mood(
-        entity=entityExtractor(sData),
-        value=sData.sentiment.magnitude*sData.sentiment.score,
-        moodType="Category"
-      )
-    },timings)
-
-
+      },("key",""),timings, moodReduce)
 
   def moodReduce(Mood1: Mood, Mood2: Mood): Mood = {
-    if (!Mood1.entity.equals(Mood2.entity)) {
+    if (!Mood1.key.equals(Mood2.key)) {
       sys.error("MOOD PROBLEM!")
     }
 
     Mood(
-      entity = Mood1.entity,
+      key = Mood1.key,
       value = Mood1.value + Mood2.value,
       moodType = Mood1.moodType
     )
@@ -251,19 +255,11 @@ object SentimentAnalysis {
       }
 
       timings match {
-        case (t1, 0)  if t1 > 0           => localStream.timeWindow(seconds(t1))
-                                                        .reduce{ reducer }
-
-        case (t1, t2) if t1 > 0 && t2 > 0 => localStream.timeWindow(seconds(t1), seconds(t2))
-                                                        .reduce{ reducer }
-
+        case (t1, 0)  if t1 > 0           => localStream.timeWindow(seconds(t1)).reduce{ reducer }
+        case (t1, t2) if t1 > 0 && t2 > 0 => localStream.timeWindow(seconds(t1), seconds(t2)).reduce{ reducer }
         case _                            => localStream.reduce{ reducer }
       }
   }
-
-  def processMoodStream(stream: DataStream[Mood], timings: (Int,Int)): DataStream[Mood] =
-    processChatStream(stream, ("entity",""),timings, moodReduce)
-
 
   def processMessageStream(stream: DataStream[Message], timings: (Int, Int)): DataStream[Message] =
     processChatStream(stream, ("channel","user"),timings, messageReduce)
@@ -284,23 +280,26 @@ object SentimentAnalysis {
                           sampleSize: Int,
                           threshold: Int): DataStream[Mood] =
     stream
-      .keyBy("entity")
+      .keyBy("key")
       .countWindow(sampleSize)
       .sum("value")
       .filter( _.value <= threshold )
 
-    case class Message(channel: String, user: String, text: String)
+  trait HoldsSentiment{ def sentiment: Sentiment}
 
-    case class Sentiment(score: Float, magnitude: Float)
-    case class Entity(entity: String, salience: Float, sentiment: Sentiment)
+  case class Message(channel: String, user: String, text: String)
 
-    case class MessageSentiment(message: Message, sentiment: Sentiment)
-    case class MessageEntities(message: Message, entities: List[Entity])
+  case class Sentiment(score: Float, magnitude: Float)
 
-    case class Mood(entity: String, value: Float, moodType: String)
+  case class Entity(entity: String, salience: Float, sentiment: Sentiment) extends HoldsSentiment
+  case class MessageSentiment(message: Message, sentiment: Sentiment) extends HoldsSentiment
 
-    case class Category(category: String, confidence: Float)
-    case class MessageCategories(message: Message, categories: List[Category])
-    case class CategorySentiment(message: Message, category: Category, sentiment: Sentiment)
+  case class MessageEntities(message: Message, entities: List[Entity])
+
+  case class Mood(key: String, value: Float, moodType: String)
+
+  case class Category(category: String, confidence: Float)
+  case class MessageCategories(message: Message, categories: List[Category])
+  case class CategorySentiment(message: Message, category: Category, sentiment: Sentiment) extends HoldsSentiment
 
 }
