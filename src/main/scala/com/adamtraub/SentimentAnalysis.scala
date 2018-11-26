@@ -33,8 +33,8 @@ import scala.collection.mutable
 object SentimentAnalysis {
   def main(args: Array[String]) {
 
-    val url = "localhost"
-    val port = 9001
+    val url = ParameterTool.fromArgs(args).get("url","localhost")
+    val port = ParameterTool.fromArgs(args).getInt("port", 9001)
 
 
     val env = StreamExecutionEnvironment.getExecutionEnvironment
