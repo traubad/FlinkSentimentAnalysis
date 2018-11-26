@@ -43,6 +43,8 @@ object SentimentAnalysis {
     val env = StreamExecutionEnvironment.getExecutionEnvironment
     val dataStream = env.socketTextStream(url, port)
 
+    //val languageSet = env.fromCollection( List[LanguageServiceClient](LanguageServiceClient.create()))
+
     //blocks a given user's messages together every 5 seconds
     val parsedStream: DataStream[Message] =
       processMessageStream(dataStream.map { w =>
@@ -98,7 +100,7 @@ object SentimentAnalysis {
         entitiesList
             .map { ent =>
             entities += Entity(
-              entity = ent.getName,
+              key = ent.getName,
               salience = ent.getSalience,
               sentiment = Sentiment(
                 ent.getSentiment.getScore,
@@ -107,7 +109,35 @@ object SentimentAnalysis {
             )
           }
         entities
-      }.filter( _.sentiment.score == 0)
+      }
+
+    val topicStream: DataStream[EntityCount] = entityStream
+      .map { eData =>
+        EntityCount(
+          key = eData.key,
+          count = 1
+        )
+      }
+      .keyBy("key")
+      .timeWindow(seconds(10))
+      .sum("count")
+
+
+//      val trendingStream: DataStream[EntityCount] = topicStream
+//      .flatMap{ eData =>
+//        var entityCounts = new mutable.MutableList[EntityCount]
+//        topicStream
+//          .keyBy("_")
+//          .sum("count")
+//          .map{ tData =>
+//            entityCounts += EntityCount(
+//              key = eData.key,
+//              count = eData.count,
+//              percentage = eData.percentage/tData.count
+//            )
+//          }
+//        entityCounts.toList
+//      }
 
     //This attempts to take a block of text and determine the topics/categories
     val categoryStream: DataStream[MessageCategories] = aggregateStream
@@ -172,15 +202,21 @@ object SentimentAnalysis {
     val entityOpinionStream: DataStream[Mood] =
       buildMoodStream(
         stream = entityStream,
-        keyExtractor = (sData: Entity) => sData.entity:String,
+        keyExtractor = (sData: Entity) => sData.key:String,
         moodType="Entity",
         timings = (30,0)
       )
 
+    val toxicTopicStream: DataStream[Mood] =
+      buildToxicityStream(
+        stream = entityOpinionStream,
+        sampleSize = 25,
+        threshold = -20)
+
     val toxicUserStream: DataStream[Mood] =
       buildToxicityStream(
         stream = userMoodStream,
-        sampleSize = 10,
+        sampleSize = 15,
         threshold = -8)
 
     val toxicChannelStream: DataStream[Mood] =
@@ -193,18 +229,20 @@ object SentimentAnalysis {
     sentimentStream.print()
     entityStream.print()
     entityOpinionStream.print()
+    topicStream.print()
     userMoodStream.print()
     channelMoodStream.print()
+    categoryOpinionStream.print()
+    toxicTopicStream.print()
     toxicUserStream.print()
     toxicChannelStream.print()
-    categoryOpinionStream.print()
 
     env.execute("Slack Analysis")
   }
 
   //This helper method reduces some repeated code and prevents
   def getSentimentFromString(text: String): com.google.cloud.language.v1.Sentiment = {
-    val language = LanguageServiceClient.create()
+    val language: LanguageServiceClient = LanguageServiceClient.create()
     val document = language.analyzeSentiment(Document.newBuilder()
       .setContent(text)
       .setType(Type.PLAIN_TEXT)
@@ -290,10 +328,10 @@ object SentimentAnalysis {
   case class Message(channel: String, user: String, text: String)
 
   case class Sentiment(score: Float, magnitude: Float)
-
-  case class Entity(entity: String, salience: Float, sentiment: Sentiment) extends HoldsSentiment
   case class MessageSentiment(message: Message, sentiment: Sentiment) extends HoldsSentiment
 
+  case class Entity(key: String, salience: Float, sentiment: Sentiment) extends HoldsSentiment
+  case class EntityCount(key: String, count: Int)
   case class MessageEntities(message: Message, entities: List[Entity])
 
   case class Mood(key: String, value: Float, moodType: String)
@@ -301,5 +339,6 @@ object SentimentAnalysis {
   case class Category(category: String, confidence: Float)
   case class MessageCategories(message: Message, categories: List[Category])
   case class CategorySentiment(message: Message, category: Category, sentiment: Sentiment) extends HoldsSentiment
+
 
 }
