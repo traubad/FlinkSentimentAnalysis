@@ -64,46 +64,39 @@ object SentimentAnalysis {
     val sentimentStream = parsedStream
       .map { mData =>
 
-        val language = LanguageServiceClient.create()
-        val sentiment = language.analyzeSentiment(Document.newBuilder()
-          .setContent(mData.text)
-          .setType(Type.PLAIN_TEXT)
-          .build()).getDocumentSentiment
-
-        language.close
-
-        MessageSentiment(mData, Sentiment(sentiment.getScore, sentiment.getMagnitude))
-      }
-
-    val sentimentSentenceStream = parsedStream
-      .map { mData =>
-
+        var sentiments = new mutable.MutableList[MessageSentiment]
         val language = LanguageServiceClient.create()
         val document = language.analyzeSentiment(Document.newBuilder()
           .setContent(mData.text)
           .setType(Type.PLAIN_TEXT)
           .build())
-        language.close
 
-        document.getSentencesList.map{ sent =>
-          MessageSentiment(
-            message = Message(
-              channel = mData.channel,
-              user = mData.user,
-              text = sent.getText.getContent
-            ),
-            sentiment = Sentiment(sent.getSentiment.getScore, sent.getSentiment.getMagnitude)
-          )
+        language.close()
+        val docSentiment = document.getDocumentSentiment
+
+        sentiments += MessageSentiment(mData, Sentiment(docSentiment.getScore, docSentiment.getMagnitude))
+        if(document.getSentencesCount > 1) {
+          document.getSentencesList.map { sent =>
+            sentiments += MessageSentiment(
+              message = Message(
+                channel = mData.channel,
+                user = mData.user,
+                text = sent.getText.getContent
+              ),
+              sentiment = Sentiment(sent.getSentiment.getScore, sent.getSentiment.getMagnitude)
+            )
+          }
         }
+        sentiments.toList
       }
 
-    val entityStream = sentimentStream
+    val entityStream = parsedStream
       .map { mData =>
 
-        var entities = new MutableList[Entity]
+        var entities = new mutable.MutableList[Entity]
         val language = LanguageServiceClient.create()
         val doc = Document.newBuilder()
-          .setContent(mData.message.text)
+          .setContent(mData.text)
           .setType(Type.PLAIN_TEXT)
           .build()
 
@@ -124,10 +117,9 @@ object SentimentAnalysis {
             )
           }
 
-        language.close
-        MessageSentimentEntities(
-          message = mData.message,
-          sentiment = mData.sentiment,
+        language.close()
+        MessageEntities(
+          message = mData,
           entities = entities.toList
         )
       }
@@ -153,14 +145,14 @@ object SentimentAnalysis {
             .map { cat =>
               outList += Category(cat.getName, cat.getConfidence)
             }
-          language.close
+          language.close()
         } else {
           outList += Category("N/A Not enough data", 0)
         }
         MessageCategories(mData, outList.toList)
       }
 
-      sentimentSentenceStream.print()
+      sentimentStream.print()
       entityStream.print()
       categoryStream.print()
 
@@ -170,10 +162,9 @@ object SentimentAnalysis {
 
     case class Message(channel: String, user: String, text: String)
     case class Sentiment(score: Float, magnitude: Float)
-    case class MessageSentiment(message: Message, sentiment: Sentiment)
-    case class MessageSentimentEntities(message: Message, sentiment: Sentiment, entities: List[Entity])
     case class Entity(entity: String, salience: Float, sentiment: Sentiment)
-    case class Annotation()
+    case class MessageSentiment(message: Message, sentiment: Sentiment)
+    case class MessageEntities(message: Message, entities: List[Entity])
 
     case class Category(category: String, confidence: Float)
     case class MessageCategories(message: Message, categories: List[Category])
