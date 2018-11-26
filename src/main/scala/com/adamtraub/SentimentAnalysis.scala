@@ -20,12 +20,14 @@ package com.adamtraub
 
 import com.google.cloud.language.v1._
 import com.google.cloud.language.v1.Document.Type
+import org.apache.flink.api.java.tuple.Tuple
 import org.apache.flink.streaming.api.scala._
-import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.api.windowing.time.Time.{seconds, minutes}
 
 import scala.collection.JavaConversions._
 import scala.collection.mutable.MutableList
 import org.apache.flink.api.java.utils.ParameterTool
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow
 
 import scala.collection.mutable
 
@@ -35,6 +37,7 @@ object SentimentAnalysis {
 
     val url = ParameterTool.fromArgs(args).get("url","localhost")
     val port = ParameterTool.fromArgs(args).getInt("port", 9001)
+    println("port: "+port+"\nurl:"+url)
 
 
     val env = StreamExecutionEnvironment.getExecutionEnvironment
@@ -45,11 +48,11 @@ object SentimentAnalysis {
       processMessageStream(dataStream.map { w =>
         val msg = w.split(",")
         Message(msg(0), msg(1), msg.drop(2).mkString(","))
-      },5)
+      },(5,0))
 
     //blocks a given user's messages together every 100 seconds
     val aggregateStream: DataStream[Message] =
-      processMessageStream(parsedStream,100)
+      processMessageStream(parsedStream,(100,0))
 
     val sentimentStream: DataStream[MessageSentiment] = parsedStream
       .map { mData =>
@@ -175,8 +178,8 @@ object SentimentAnalysis {
         threshold = -30)
 
 
-    //sentimentStream.print()
-    //entityStream.print()
+    sentimentStream.print()
+    entityStream.print()
     userMoodStream.print()
     channelMoodStream.print()
     toxicUserStream.print()
@@ -201,13 +204,13 @@ object SentimentAnalysis {
   def buildMoodStream(stream: DataStream[MessageSentiment],
                   entityExtractor: MessageSentiment => String,
                   moodType: String, timings: (Int,Int)): DataStream[Mood] =
-    processMoodStream(stream.map{ sData =>
+    processChatStream(stream.map{ sData =>
         Mood(
           entity=entityExtractor(sData),
           value=sData.sentiment.magnitude*sData.sentiment.score,
           moodType=moodType
         )
-      },timings)
+      },("entity",""),timings, moodReduce)
 
   def buildMoodStream(stream: DataStream[CategorySentiment],
                   entityExtractor: CategorySentiment => String,
@@ -220,11 +223,7 @@ object SentimentAnalysis {
       )
     },timings)
 
-  def processMoodStream(stream: DataStream[Mood], timings: (Int,Int)): DataStream[Mood] =
-    stream
-      .keyBy("entity")
-      .timeWindow(Time.seconds(timings._1),Time.seconds(timings._2))
-      .reduce { (Mood1, Mood2) => moodReduce(Mood1, Mood2) }
+
 
   def moodReduce(Mood1: Mood, Mood2: Mood): Mood = {
     if (!Mood1.entity.equals(Mood2.entity)) {
@@ -238,17 +237,37 @@ object SentimentAnalysis {
     )
   }
 
-  def processMessageStream(stream: DataStream[Message], timing: Int): DataStream[Message] =
-    stream
-      .keyBy("channel", "user")
-      .timeWindow(Time.seconds(timing))
-      .reduce{(message1, message2) => messageReduce(message1, message2)}
+  def processChatStream[A](
+                            stream: DataStream[A],
+                            keyField: (String,String),
+                            timings: (Int,Int),
+                            reducer: (A, A) =>  A
+                          ): DataStream[A] = {
+
+    val localStream =
+      keyField match {
+        case (k1, "") => stream.keyBy(k1)
+        case (k1, k2) => stream.keyBy(k1, k2)
+      }
+
+      timings match {
+        case (t1, 0)  if t1 > 0           => localStream.timeWindow(seconds(t1))
+                                                        .reduce{ reducer }
+
+        case (t1, t2) if t1 > 0 && t2 > 0 => localStream.timeWindow(seconds(t1), seconds(t2))
+                                                        .reduce{ reducer }
+
+        case _                            => localStream.reduce{ reducer }
+      }
+  }
+
+  def processMoodStream(stream: DataStream[Mood], timings: (Int,Int)): DataStream[Mood] =
+    processChatStream(stream, ("entity",""),timings, moodReduce)
+
 
   def processMessageStream(stream: DataStream[Message], timings: (Int, Int)): DataStream[Message] =
-    stream
-      .keyBy("channel", "user")
-      .timeWindow(Time.seconds(timings._1),Time.seconds(timings._2))
-      .reduce{(message1, message2) => messageReduce(message1, message2)}
+    processChatStream(stream, ("channel","user"),timings, messageReduce)
+
 
   def messageReduce(message1: Message, message2: Message) : Message = {
     if (!message1.user.equals(message2.user)) {
@@ -270,9 +289,7 @@ object SentimentAnalysis {
       .sum("value")
       .filter( _.value <= threshold )
 
-    abstract class TextData {}
-
-    case class Message(channel: String, user: String, text: String) extends TextData
+    case class Message(channel: String, user: String, text: String)
 
     case class Sentiment(score: Float, magnitude: Float)
     case class Entity(entity: String, salience: Float, sentiment: Sentiment)
@@ -284,5 +301,6 @@ object SentimentAnalysis {
 
     case class Category(category: String, confidence: Float)
     case class MessageCategories(message: Message, categories: List[Category])
-    case class CategorySentiment(message: Message, category: Category, sentiment: Sentiment) extends TextData
+    case class CategorySentiment(message: Message, category: Category, sentiment: Sentiment)
+
 }
