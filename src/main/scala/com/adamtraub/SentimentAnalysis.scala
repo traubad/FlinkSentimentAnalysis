@@ -20,12 +20,10 @@ package com.adamtraub
 
 import com.google.cloud.language.v1._
 import com.google.cloud.language.v1.Document.Type
-import org.apache.flink.api.java.tuple.Tuple
 import org.apache.flink.streaming.api.scala._
 import org.apache.flink.streaming.api.windowing.time.Time.{seconds, minutes}
 
 import scala.collection.JavaConversions._
-import scala.collection.mutable.MutableList
 import org.apache.flink.api.java.utils.ParameterTool
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow
 
@@ -37,20 +35,17 @@ object SentimentAnalysis {
 
     val url = ParameterTool.fromArgs(args).get("url","localhost")
     val port = ParameterTool.fromArgs(args).getInt("port", 9001)
-    println("port: "+port+"\nurl:"+url)
-
+    println("port: "+port+"\nurl: "+url)
 
     val env = StreamExecutionEnvironment.getExecutionEnvironment
     val dataStream = env.socketTextStream(url, port)
-
-    //val languageSet = env.fromCollection( List[LanguageServiceClient](LanguageServiceClient.create()))
 
     //blocks a given user's messages together every 5 seconds
     val parsedStream: DataStream[Message] =
       processMessageStream(dataStream.map { w =>
         val msg = w.split(",")
         Message(msg(0), msg(1), msg.drop(2).mkString(","))
-      },(5,0))
+      },(1,0))
 
     //blocks a given user's messages together every 100 seconds for larger, categorical analysis
     val aggregateStream: DataStream[Message] =
@@ -59,24 +54,8 @@ object SentimentAnalysis {
     //A stream to get Sentiment based on the user's input
     val sentimentStream: DataStream[MessageSentiment] = parsedStream
       .map { mData =>
-        //var sentiments = new mutable.MutableList[MessageSentiment]
         val docSentiment = getSentimentFromString(mData.text)
         MessageSentiment(mData, Sentiment(docSentiment.getScore, docSentiment.getMagnitude))
-
-//        sentiments += MessageSentiment(mData, Sentiment(docSentiment.getScore, docSentiment.getMagnitude))
-//        if(document.getSentencesCount > 1) {
-//          document.getSentencesList.map { sent =>
-//            sentiments += MessageSentiment(
-//              message = Message(
-//                channel = mData.channel,
-//                user = mData.user,
-//                text = sent.getText.getContent
-//              ),
-//              sentiment = Sentiment(sent.getSentiment.getScore, sent.getSentiment.getMagnitude)
-//            )
-//          }
-//        }
-//        sentiments.toList
       }
 
     //The entity stream creates a list of entities and their corresponding sentiments
@@ -96,7 +75,9 @@ object SentimentAnalysis {
             .setEncodingType(EncodingType.UTF16)
             .build())
           .getEntitiesList
+
         language.close()
+
         entitiesList
             .map { ent =>
             entities += Entity(
@@ -122,6 +103,8 @@ object SentimentAnalysis {
       .timeWindow(seconds(10))
       .sum("count")
 
+    // I couldn't get this one working, the idea was to figure out
+    // the percentage a given entity dominates a conversation
 
 //      val trendingStream: DataStream[EntityCount] = topicStream
 //      .flatMap{ eData =>
@@ -139,7 +122,7 @@ object SentimentAnalysis {
 //        entityCounts.toList
 //      }
 
-    //This attempts to take a block of text and determine the topics/categories
+    //Given a block of code determine the topics/categories
     val categoryStream: DataStream[MessageCategories] = aggregateStream
       .map { mData =>
         var outList = new mutable.MutableList[Category]
@@ -164,6 +147,7 @@ object SentimentAnalysis {
         MessageCategories(mData, outList.toList)
       }
 
+    //determines the general sentiment associated with a given category
     val categorySentimentStream: DataStream[CategorySentiment] = categoryStream
       .flatMap { mCat =>
         val docSentiment = getSentimentFromString(mCat.message.text)
@@ -180,7 +164,7 @@ object SentimentAnalysis {
         stream = sentimentStream,
         keyExtractor = (sData: MessageSentiment) => sData.message.user:String,
         moodType = "User",
-        timings = (90,60)
+        timings = (0,0)
       )
 
     val channelMoodStream: DataStream[Mood] =
@@ -211,31 +195,34 @@ object SentimentAnalysis {
       buildToxicityStream(
         stream = entityOpinionStream,
         sampleSize = 25,
-        threshold = -20)
+        threshold = -20
+      )
 
     val toxicUserStream: DataStream[Mood] =
       buildToxicityStream(
         stream = userMoodStream,
-        sampleSize = 15,
-        threshold = -8)
+        sampleSize = 10,
+        threshold = -10
+      )
 
     val toxicChannelStream: DataStream[Mood] =
       buildToxicityStream(
         stream = userMoodStream,
         sampleSize = 50,
-        threshold = -30)
+        threshold = -30
+      )
 
 
     sentimentStream.print()
-    entityStream.print()
-    entityOpinionStream.print()
-    topicStream.print()
-    userMoodStream.print()
-    channelMoodStream.print()
-    categoryOpinionStream.print()
-    toxicTopicStream.print()
+//    entityStream.print()
+//    entityOpinionStream.print()
+//    topicStream.print()
+//    userMoodStream.print()
+//    channelMoodStream.print()
+//    categoryOpinionStream.print()
+//    toxicTopicStream.print()
     toxicUserStream.print()
-    toxicChannelStream.print()
+//    toxicChannelStream.print()
 
     env.execute("Slack Analysis")
   }
@@ -332,13 +319,10 @@ object SentimentAnalysis {
 
   case class Entity(key: String, salience: Float, sentiment: Sentiment) extends HoldsSentiment
   case class EntityCount(key: String, count: Int)
-  case class MessageEntities(message: Message, entities: List[Entity])
 
   case class Mood(key: String, value: Float, moodType: String)
 
   case class Category(category: String, confidence: Float)
   case class MessageCategories(message: Message, categories: List[Category])
   case class CategorySentiment(message: Message, category: Category, sentiment: Sentiment) extends HoldsSentiment
-
-
 }
